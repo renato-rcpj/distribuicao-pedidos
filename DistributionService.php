@@ -2,141 +2,135 @@
 
 namespace App\Services;
 
-use Illuminate\Support\Facades\DB;
 use App\Models\Protocol;
 use App\Models\Examiner;
 use App\Models\DistributionPointer;
+use Illuminate\Support\Facades\DB;
+use Exception;
 
 class DistributionService
 {
-    public function distribute(array $protocolNumbers, string $serviceType, string $date, bool $useAuxiliary = false, array $auxiliaryExaminerIds = [])
+    public function distribute(array $protocols, string $serviceType, string $date, bool $isAuxiliary = false, array $auxTeamIds = [])
     {
-        // Usando transaction pra dar rollback se ninguém puder receber o protocolo
-        return DB::transaction(function () use ($protocolNumbers, $serviceType, $date, $useAuxiliary, $auxiliaryExaminerIds) {
+        return DB::transaction(function () use ($protocols, $serviceType, $date, $isAuxiliary, $auxTeamIds) {
             
-            // 1. Anti-Duplicidade: tira da lista quem já tá no banco
-            $existingProtocols = Protocol::whereIn('number', $protocolNumbers)->pluck('number')->toArray();
-            $newProtocols = array_diff($protocolNumbers, $existingProtocols);
+            // filtra quem já existe no banco pra evitar duplicidade
+            $existing = Protocol::whereIn('number', $protocols)->pluck('number')->toArray();
+            $newProtocols = array_diff($protocols, $existing);
 
             if (empty($newProtocols)) {
-                return ['success' => false, 'message' => 'Todos os protocolos inseridos já existem.'];
+                return ['success' => false, 'msg' => 'Todos os protocolos informados já constam na base.'];
             }
 
-            // 2. Define as equipes e qual ponteiro usar
-            $teamIds = [];
-            $pointerKey = '';
+            // carrega as configs da equipe com base no serviço
+            $teamData = $this->getTeamSettings($serviceType, $isAuxiliary, $auxTeamIds);
+            $teamIds = $teamData['ids'];
+            $pointerKey = $teamData['pointer'];
 
-            if ($useAuxiliary) {
-                if (empty($auxiliaryExaminerIds)) {
-                    throw new \Exception('Nenhum examinador auxiliar selecionado.');
-                }
-                $teamIds = array_values($auxiliaryExaminerIds); // Reseta as chaves do array
-                $pointerKey = 'pointer_Auxiliar'; 
-            } else {
-                switch ($serviceType) {
-                    case 'Contrato':
-                    case 'Alteracao':
-                        $teamIds = [1, 2, 3, 4]; // IDs do grupo de contratos
-                        $pointerKey = 'pointer_GrupoContratos';
-                        break;
-                    case 'Ata':
-                    case 'Estatuto':
-                        $teamIds = [5, 6, 7, 8, 9, 10, 11]; // IDs do grupo de atas
-                        $pointerKey = 'pointer_GrupoAtas'; // Ata e Estatuto compartilham a mesma fila
-                        break;
-                    case 'Documentos':
-                    case 'AAEE':
-                    case 'CEC':
-                        $teamIds = [12, 13]; // IDs da galera de documentos
-                        $pointerKey = 'pointer_Documentos';
-                        break;
-                    default:
-                        throw new \Exception('Tipo de serviço inválido.');
-                }
+            if (empty($teamIds)) {
+                throw new Exception('Nenhum examinador definido para esta distribuição.');
             }
 
-            // 3. Puxa os dados só da equipe selecionada
             $examiners = Examiner::whereIn('id', $teamIds)->get()->keyBy('id');
             $teamSize = count($teamIds);
 
-            // 4. Pega onde a fila parou na última vez
-            $pointerRecord = DistributionPointer::firstOrCreate(
+            // pega o index de onde a fila parou (ou começa do -1 se for a primeira vez)
+            $pointer = DistributionPointer::firstOrCreate(
                 ['group_key' => $pointerKey],
                 ['last_index' => -1]
             );
-            $currentIndex = $pointerRecord->last_index;
-
+            
+            $currentIndex = $pointer->last_index;
             $distributedCount = 0;
-            $teamAbsent = false;
 
-            // 5. O loop do Rodízio
             foreach ($newProtocols as $protocolNumber) {
-                $foundExaminer = false;
+                $assignedExaminer = null;
                 $attempts = 0;
                 
-                // Limite de segurança pra não travar o loop: tamanho da equipe + os débitos + uma margem
-                $totalDebits = $examiners->sum('debit_balance');
-                $maxAttempts = $teamSize + $totalDebits + 2;
+                // limite de segurança: rodar a equipe inteira + margem dos débitos pra não travar num loop
+                $maxAttempts = $teamSize + $examiners->sum('debit_balance') + 2;
 
-                while (!$foundExaminer && $attempts < $maxAttempts) {
+                while (!$assignedExaminer && $attempts < $maxAttempts) {
                     $currentIndex++;
                     
                     if ($currentIndex >= $teamSize) {
-                        $currentIndex = 0; // Fila rodou, volta pro começo
+                        $currentIndex = 0; // reseta a fila
                     }
 
-                    $candidateId = $teamIds[$currentIndex];
-                    $candidate = $examiners->get($candidateId);
+                    $candidate = $examiners->get($teamIds[$currentIndex]);
 
-                    // Só avalia se não tiver de férias/ausente
+                    // avalia só se o cara estiver ativo
                     if ($candidate && !$candidate->is_absent) {
                         
-                        if ($useAuxiliary) {
-                            // Se for equipe auxiliar, o cara ganha um débito pra ser pulado depois na fila normal
+                        if ($isAuxiliary) {
+                            // pega por fora, ganha 1 débito pra compensar na fila normal
                             $candidate->increment('debit_balance');
-                            $foundExaminer = clone $candidate; // Clone por causa da referência do objeto
+                            $assignedExaminer = clone $candidate;
                         } else {
-                            // Distribuição normal: verifica se o cara tá devendo compensação
                             if ($candidate->debit_balance > 0) {
-                                // Desconta o débito e pula a vez dele
+                                // tá devendo compensação: paga 1 débito e pula a vez
                                 $candidate->decrement('debit_balance');
                             } else {
-                                // Limpo! Recebe o processo
-                                $foundExaminer = clone $candidate;
+                                $assignedExaminer = clone $candidate;
                             }
                         }
                     }
                     $attempts++;
                 }
 
-                // 6. Faz o insert no banco
-                if ($foundExaminer) {
-                    Protocol::create([
-                        'number' => $protocolNumber,
-                        'examiner_id' => $foundExaminer->id,
-                        'service_type' => $serviceType,
-                        'date' => $date,
-                    ]);
-                    $distributedCount++;
-                } else {
-                    $teamAbsent = true;
-                    break; 
+                if (!$assignedExaminer) {
+                    DB::rollBack();
+                    return ['success' => false, 'msg' => 'Equipe indisponível ou travada por excesso de ausências/débitos.'];
                 }
+
+                Protocol::create([
+                    'number' => $protocolNumber,
+                    'examiner_id' => $assignedExaminer->id,
+                    'service_type' => $serviceType,
+                    'date' => $date,
+                ]);
+                
+                $distributedCount++;
             }
 
-            if ($teamAbsent) {
-                DB::rollBack();
-                return ['success' => false, 'message' => 'Toda a equipe está ausente ou indisponível devido a débitos.'];
-            }
-
-            // 7. Salva a nova posição do ponteiro
-            $pointerRecord->update(['last_index' => $currentIndex]);
+            // salva de onde vai começar na próxima rodada
+            $pointer->update(['last_index' => $currentIndex]);
 
             return [
                 'success' => true, 
-                'message' => "$distributedCount protocolos distribuídos com sucesso.",
-                'duplicates_ignored' => count($existingProtocols)
+                'msg' => "{$distributedCount} protocolos distribuídos com sucesso.",
+                'ignored' => count($existing)
             ];
         });
+    }
+
+    /**
+     * Mapeia os IDs e ponteiros de cada grupo
+     */
+    private function getTeamSettings(string $type, bool $isAuxiliary, array $auxIds): array
+    {
+        if ($isAuxiliary) {
+            return [
+                'ids' => array_values($auxIds),
+                'pointer' => 'pointer_Auxiliar'
+            ];
+        }
+
+        // TODO: Num cenário ideal, isso vem do banco. Fixado conforme regra de negócio.
+        return match ($type) {
+            'Contrato', 'Alteracao' => [
+                'ids' => [1, 2, 3, 4], 
+                'pointer' => 'pointer_GrupoContratos'
+            ],
+            'Ata', 'Estatuto' => [
+                'ids' => [5, 6, 7, 8, 9, 10, 11], 
+                'pointer' => 'pointer_GrupoAtas'
+            ],
+            'Documentos', 'AAEE', 'CEC' => [
+                'ids' => [12, 13], 
+                'pointer' => 'pointer_Documentos'
+            ],
+            default => throw new Exception("Serviço não reconhecido: {$type}"),
+        };
     }
 }
